@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import date
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -48,6 +49,14 @@ ESQUEMA_RESPOSTA_GEMINI = types.Schema(
         "acionar_handoff": types.Schema(
             type=types.Type.BOOLEAN,
             description="True se: score >= 61 E tem project_type + timing_months + ticket_brl preenchidos, OU se ticket_brl > 1000000, OU se lead pediu explicitamente para falar com humano."
+        ),
+        "follow_up_data": types.Schema(
+            type=types.Type.STRING,
+            description="Se o lead pedir explicitamente pra ser contactado numa data ou prazo específico (ex: 'me chama semana que vem', 'fala comigo depois do dia 20', 'só decido mês que vem'), calcule a data absoluta a partir de HOJE e preencha em formato YYYY-MM-DD. Se o lead não pediu nenhum prazo específico, deixe null ou string vazia."
+        ),
+        "follow_up_nota": types.Schema(
+            type=types.Type.STRING,
+            description="Se preencheu follow_up_data, resuma em poucas palavras o motivo/contexto do follow-up (ex: 'confirmar depois do 13º salário', 'decide com a esposa até lá'). Senão, deixe vazio."
         )
     },
     required=["pensamento_interno", "intencao_cliente", "mensagem_para_cliente", "dados_extraidos", "score", "acionar_handoff"]
@@ -90,6 +99,9 @@ Analise o histórico completo. Se o lead já respondeu uma dimensão espontaneam
 
 ### HANDOFF:
 Quando tiver project_type + timing_months + ticket_brl preenchidos E score >= 61, acione handoff=true. Você (Maikon) assume a conversa a partir daí.
+
+### FOLLOW-UP AGENDADO:
+Se o lead pedir explicitamente pra ser contactado depois ("me chama semana que vem", "fala comigo dia 20", "só decido mês que vem"), aceite naturalmente, NÃO insista em continuar a qualificação agora — preencha follow_up_data/follow_up_nota e deixe o resto pra data combinada.
 """
 
 # --- FUNÇÃO: Busca KB ativa do Supabase ---
@@ -173,7 +185,8 @@ async def process_prospect_message(req: ChatRequest):
         if qualification_atual:
             qualificacao_str = f"\n\n### DADOS JÁ COLETADOS DESTE LEAD:\n{json.dumps(qualification_atual, ensure_ascii=False, indent=2)}"
 
-        prompt_completo = f"{system_prompt}{qualificacao_str}\n\n### HISTÓRICO DA CONVERSA:\n{historico_formatado}"
+        data_hoje = date.today().isoformat()
+        prompt_completo = f"{system_prompt}{qualificacao_str}\n\n### DATA DE HOJE: {data_hoje}\n\n### HISTÓRICO DA CONVERSA:\n{historico_formatado}"
 
         # 4. CHAMA O GEMINI
         response_ia = genai_client.models.generate_content(
@@ -194,6 +207,8 @@ async def process_prospect_message(req: ChatRequest):
         score = min(100, max(0, resultado.get("score", 0)))
         acionar_handoff = resultado.get("acionar_handoff", False)
         dados_extraidos = resultado.get("dados_extraidos", {})
+        follow_up_data = (resultado.get("follow_up_data") or "").strip() or None
+        follow_up_nota = (resultado.get("follow_up_nota") or "").strip() or None
 
         # Merge dos dados extraídos (não sobrescreve campos já preenchidos com None)
         qualification_atualizada = {**qualification_atual}
@@ -235,6 +250,16 @@ async def process_prospect_message(req: ChatRequest):
 
         temperatura = score_para_temperatura(score)
 
+        # Valida a data de follow-up (Gemini às vezes erra o formato ou manda data no passado)
+        follow_up_valido = None
+        if follow_up_data:
+            try:
+                d = date.fromisoformat(follow_up_data)
+                if d >= date.today():
+                    follow_up_valido = follow_up_data
+            except ValueError:
+                pass
+
         # 6. SALVA NO BANCO
         update_data = {
             "historico_conversa": historico,
@@ -250,8 +275,14 @@ async def process_prospect_message(req: ChatRequest):
             "resultado_esperado": qualification_atualizada.get("timing_months"),
             "budget_status": str(qualification_atualizada.get("ticket_brl", "")) if qualification_atualizada.get("ticket_brl") else None,
         }
+        if follow_up_valido:
+            update_data["follow_up_em"] = follow_up_valido
+            update_data["follow_up_nota"] = follow_up_nota
 
         supabase.table("leads_qualificacao").update(update_data).eq("lead_id", req.lead_id).execute()
+
+        if follow_up_valido:
+            print(f"📅 [{req.lead_id}] Follow-up agendado pra {follow_up_valido} — {follow_up_nota or ''}")
 
         print(f"✅ [{req.lead_id}] Score={score} Temp={temperatura} Handoff={acionar_handoff} Intenção={intencao}")
 
@@ -310,7 +341,83 @@ async def verificar_intercepcao_humana(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- ROTA 3: HEALTH CHECK ---
+# --- ROTA 3: RETOMAR FOLLOW-UP AGENDADO ---
+class FollowUpRequest(BaseModel):
+    lead_id: str
+
+@app.post("/api/v1/prospeccao/follow-up")
+async def retomar_follow_up(req: FollowUpRequest):
+    """
+    Chamada pelo cron do n8n quando chega a data de follow_up_em de um lead.
+    Gera uma mensagem natural de retomada (sem inventar uma fala do lead no histórico)
+    e limpa o agendamento. Quem envia no WhatsApp é o n8n, esta rota só compõe o texto.
+    """
+    try:
+        lead_query = supabase.table("leads_qualificacao").select("*").eq("lead_id", req.lead_id).execute()
+        if not lead_query.data:
+            return {"mensagem_para_cliente": "", "status": "lead_nao_encontrado"}
+
+        lead_atual = lead_query.data[0]
+
+        if lead_atual.get("status_bot") in ("pausado_humano", "pausado", "descartado"):
+            return {"mensagem_para_cliente": "", "status": "ignorado_bot_pausado"}
+
+        historico = lead_atual.get("historico_conversa", [])
+        qualification_atual = lead_atual.get("dados_extraidos") or {}
+        follow_up_nota = lead_atual.get("follow_up_nota") or ""
+
+        historico_recente = historico[-20:]
+        historico_formatado = "\n".join([
+            f"{msg['role'].upper()}: {msg['content']}" for msg in historico_recente
+        ])
+
+        system_prompt = montar_system_prompt()
+        qualificacao_str = ""
+        if qualification_atual:
+            qualificacao_str = f"\n\n### DADOS JÁ COLETADOS DESTE LEAD:\n{json.dumps(qualification_atual, ensure_ascii=False, indent=2)}"
+
+        data_hoje = date.today().isoformat()
+        instrucao_retomada = (
+            f"\n\n### RETOMADA DE FOLLOW-UP (instrução do sistema, não é fala do lead):\n"
+            f"Hoje ({data_hoje}) é a data que o próprio lead pediu pra ser recontactado. "
+            f"Motivo/contexto combinado: {follow_up_nota or 'não especificado'}.\n"
+            f"Puxe a conversa de forma natural e breve, lembrando do que ficou combinado, "
+            f"sem soar automático. Não repita uma saudação genérica."
+        )
+        prompt_completo = f"{system_prompt}{qualificacao_str}\n\n### HISTÓRICO DA CONVERSA:\n{historico_formatado}{instrucao_retomada}"
+
+        response_ia = genai_client.models.generate_content(
+            model='gemini-2.5-pro',
+            contents=prompt_completo,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ESQUEMA_RESPOSTA_GEMINI,
+                temperature=0.4
+            ),
+        )
+        resultado = json.loads(response_ia.text)
+        nova_mensagem = resultado.get("mensagem_para_cliente", "")
+
+        if nova_mensagem:
+            historico.append({"role": "assistant", "content": nova_mensagem})
+
+        update_data = {
+            "historico_conversa": historico,
+            "follow_up_em": None,
+            "follow_up_nota": None,
+        }
+        supabase.table("leads_qualificacao").update(update_data).eq("lead_id", req.lead_id).execute()
+
+        print(f"📅 [{req.lead_id}] Follow-up retomado.")
+
+        return {"mensagem_para_cliente": nova_mensagem, "status": "ok"}
+
+    except Exception as e:
+        print(f"❌ Erro ao retomar follow-up de {req.lead_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- ROTA 4: HEALTH CHECK ---
 @app.get("/health")
 async def health():
     kb = buscar_kb_ativa()
