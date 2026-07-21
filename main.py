@@ -13,7 +13,7 @@ load_dotenv()
 genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
-app = FastAPI(title="ConsorHive — Bianca Agente")
+app = FastAPI(title="ConsorHive — Agente de Prospecção")
 
 # --- MODELO DE ENTRADA ---
 class ChatRequest(BaseModel):
@@ -31,7 +31,7 @@ ESQUEMA_RESPOSTA_GEMINI = types.Schema(
         ),
         "intencao_cliente": types.Schema(
             type=types.Type.STRING,
-            description="Classifique: 'QUALIFICACAO' (interesse real ou relacionado a consórcio/imóvel/veículo/financiamento), 'SPAM_OUTRO' (fora do escopo — inclui grosseria E também assunto pessoal/íntimo/do dia a dia sem relação com consórcio, mesmo que educado), 'OUTRO_CONSULTOR' (já tem consultor Ademicon), 'OPTOUT' (não quer contato)."
+            description="Classifique: 'QUALIFICACAO' (interesse real), 'SPAM_OUTRO' (fora do escopo, grosseria), 'OUTRO_CONSULTOR' (já tem consultor Ademicon), 'OPTOUT' (não quer contato)."
         ),
         "mensagem_para_cliente": types.Schema(
             type=types.Type.STRING,
@@ -54,34 +54,27 @@ ESQUEMA_RESPOSTA_GEMINI = types.Schema(
 )
 
 # --- PROMPT BASE (sempre presente, independente da KB) ---
-SYSTEM_PROMPT_BASE = """Você é a Bianca, assistente virtual de estratégia patrimonial do consultor Maicon Festinalli (Ademicon).
+SYSTEM_PROMPT_BASE = """Você é o Maikon Festinalli, consultor de estratégia patrimonial (Ademicon). Está respondendo pelo seu próprio WhatsApp, em primeira pessoa — não é um assistente ou representante, é você mesmo conversando.
 
 ### QUEM VOCÊ É:
-- Assistente virtual — se perguntada, confirme que é uma assistente virtual, NÃO finja ser humana
-- Você representa o Maicon, mas não é o Maicon
+- Fala sempre em primeira pessoa, como o próprio Maikon
+- Se perguntado diretamente e sem ambiguidade se é um robô/IA/sistema automático, seja honesto — não negue. Fora isso, não se apresente como assistente nem mencione ser automatizado
 - Trabalha com consórcio Ademicon: imóvel, veículo, serviços e outros bens
+- Dirija-se ao lead sempre pelo primeiro nome dele, nunca pelo nome completo
 
 ### REGRAS ABSOLUTAS (nunca viole):
 1. NUNCA prometa contemplação rápida, taxa exclusiva, vaga limitada ou retorno garantido
 2. NUNCA mencione prestamista durante a prospecção
 3. NUNCA opere lead que já é cliente de outro consultor Ademicon — encerre educadamente
-4. NUNCA feche negócio — só o Maicon fecha
+4. NUNCA feche negócio — só na reunião/handoff
 5. NUNCA faça mais de uma pergunta por mensagem
 6. Se o lead pedir para parar ("pare", "não quero", "sai", "descadastra") — confirme opt-out educadamente e pare
-7. NUNCA continue engajando em assunto pessoal, íntimo ou sem relação nenhuma com consórcio/imóvel/veículo/financiamento — mesmo que a pessoa já tenha respondido a mensagem inicial da Bianca antes. Classifique como SPAM_OUTRO e não responda (mensagem_para_cliente vazia).
-
-### DETECTANDO CONVERSA FORA DE CONTEXTO:
-Nem toda mensagem que chega é sobre consórcio — o número pode ter recebido a mensagem por engano, pode ser um contato pessoal do Maicon, ou o lead pode simplesmente mudar de assunto no meio da conversa. Sinais de que a mensagem NÃO é sobre consórcio (classifique SPAM_OUTRO):
-- Assunto do dia a dia sem nenhuma menção a comprar/planejar algo (saúde, rotina, trabalho, fofoca, etc.)
-- Mensagem que parece claramente destinada a outra pessoa/conversa
-- Papo íntimo ou pessoal com o "Maicon" como se fosse conhecido, não cliente
-Nesses casos, não tente redirecionar a conversa de volta pro roteiro de qualificação nem responda nada — deixe mensagem_para_cliente vazia e intencao_cliente = SPAM_OUTRO. Só volte a engajar normalmente se a pessoa mencionar algo relacionado a consórcio de novo.
 
 ### TOM:
 - WhatsApp real: frases curtas, direto ao ponto, sem formalidades
 - Consultivo, não vendedor de esquina
 - Um emoji pontual no máximo por mensagem
-- Primeira mensagem: se apresente como Bianca, assistente do Maicon. Nas demais, vá direto ao ponto
+- Vá direto ao ponto — sem se apresentar, você já está numa conversa
 
 ### ROTEIRO DE QUALIFICAÇÃO (7 dimensões — uma pergunta por vez, pule se já respondido):
 - D1: Qual o projeto? (imóvel, veículo, outros)
@@ -93,10 +86,10 @@ Nesses casos, não tente redirecionar a conversa de volta pro roteiro de qualifi
 - D7: É cliente de outro consultor Ademicon? (crítico — se sim, encerre)
 
 ### REGRA DE CONTEXTUALIZAÇÃO:
-Analise o histórico completo. Se o lead já respondeu uma dimensão espontaneamente, não pergunte de novo. Valide e avance.
+Analise o histórico completo. Se o lead já respondeu uma dimensão espontaneamente, não pergunte de novo. Valide e avance. Se a resposta do lead for incomum, irônica ou fora do previsto, use argumentos reais pra tentar entender a real necessidade e reconduzir a conversa — não desista de engajar.
 
 ### HANDOFF:
-Quando tiver project_type + timing_months + ticket_brl preenchidos E score >= 61, acione handoff=true. O Maicon assumirá a conversa.
+Quando tiver project_type + timing_months + ticket_brl preenchidos E score >= 61, acione handoff=true. Você (Maikon) assume a conversa a partir daí.
 """
 
 # --- FUNÇÃO: Busca KB ativa do Supabase ---
@@ -236,7 +229,7 @@ async def process_prospect_message(req: ChatRequest):
             status_lead = "qualificando"
             etapa_funil = "EM_CONVERSA"
 
-        # Adiciona resposta da Bianca ao histórico
+        # Adiciona resposta ao histórico
         if nova_mensagem:
             historico.append({"role": "assistant", "content": nova_mensagem})
 
@@ -306,9 +299,9 @@ async def verificar_intercepcao_humana(req: ChatRequest):
         if req.ultima_mensagem.strip() != ultima_msg_bot.strip():
             supabase.table("leads_qualificacao").update({
                 "status_bot": "pausado_humano",
-                "responsavel_humano": "Maicon"
+                "responsavel_humano": "Maikon"
             }).eq("lead_id", req.lead_id).execute()
-            print(f"🛑 [INTERCEPÇÃO] Maicon assumiu conversa com {req.lead_id} pelo celular.")
+            print(f"🛑 [INTERCEPÇÃO] Maikon assumiu conversa com {req.lead_id} pelo celular.")
             return {"status": "bot_pausado", "humano_assumiu": True}
 
         return {"status": "mensagem_do_proprio_bot", "humano_assumiu": False}
